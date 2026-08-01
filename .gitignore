@@ -1,0 +1,9 @@
+__pycache__/
+*.o
+*.d
+out/
+dist/
+ttsim_bm/simb_ttsim_bm
+tests/tt_host_probe
+tests/out/
+*.egg-info/
