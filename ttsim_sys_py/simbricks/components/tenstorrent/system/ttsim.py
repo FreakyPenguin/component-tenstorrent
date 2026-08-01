@@ -178,6 +178,120 @@ class TenstorrentLinuxHost(sys_host.LinuxHost):
         ]
 
 
+class TenstorrentMetalHost(TenstorrentLinuxHost):
+    """Linux host that can run the TT-Metalium user-mode stack (ttnn / PyTorch).
+
+    Adds what UMD needs on top of a plain tt-kmd host. UMD maps its host-visible
+    scratch memory ("sysmem") out of a 1 GiB hugepage -- the alternative path it
+    offers, mapping ordinary pages, requires an IOMMU that this simulated
+    platform does not have. 1 GiB of physically contiguous memory cannot be
+    obtained reliably after boot, so the pages are reserved on the kernel command
+    line; UMD then locates them by scanning /proc/mounts for a hugetlbfs mount of
+    that page size.
+
+    Needs the tt-metal guest image (image/provision-tt-metal.sh).
+    """
+
+    #: Where UMD conventionally expects the 1 GiB hugetlbfs mount.
+    HUGEPAGE_MOUNT = "/dev/hugepages-1G"
+
+    def __init__(self, sys: sys_base.System, hugepages: int = 1) -> None:
+        super().__init__(sys)
+        self.hugepages: int = hugepages
+        self.kcmd_append = f"hugepagesz=1G hugepages={hugepages}"
+
+    def prepare_pre_cp(self, inst) -> list[str]:
+        return super().prepare_pre_cp(inst) + [
+            # Python and tt-metal both expect a working /dev/shm; without
+            # systemd nothing has mounted it.
+            "mkdir -p /dev/shm && mount -t tmpfs tmpfs /dev/shm || true",
+            f"mkdir -p {self.HUGEPAGE_MOUNT}",
+            f"mount -t hugetlbfs -o pagesize=1G,mode=0777 nodev {self.HUGEPAGE_MOUNT} || true",
+            # Belt and braces: if the boot-time reservation did not take, try
+            # once at runtime. Usually fails on a fragmented heap, which is
+            # exactly why the kernel command line does it first.
+            f"echo {self.hugepages} >"
+            " /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages || true",
+            "echo '=== hugepages ==='",
+            "cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages"
+            " || echo 'no 1G hugepage support'",
+            "grep hugetlbfs /proc/mounts || echo 'no hugetlbfs mounted'",
+        ]
+
+    def toJSON(self) -> dict:
+        json_obj = super().toJSON()
+        json_obj["hugepages"] = self.hugepages
+        return json_obj
+
+    @classmethod
+    def fromJSON(cls, system: sys_base.System, json_obj: dict) -> tpe.Self:
+        instance = super().fromJSON(system, json_obj)
+        instance.hugepages = utils_base.get_json_attr_top(json_obj, "hugepages")
+        return instance
+
+
+class TenstorrentMatmulApp(sys_app.BaseLinuxApplication):
+    """Run a PyTorch matrix multiply on the simulated accelerator via ttnn.
+
+    Exercises the entire Tenstorrent stack: ttnn -> TT-Metalium (which
+    JIT-compiles Tensix kernels with the bundled RISC-V toolchain) -> UMD ->
+    tt-kmd -> PCIe -> the adapter -> libttsim. The demo script itself lives in
+    the guest image at /usr/local/bin/tt_matmul_demo.py.
+    """
+
+    def __init__(
+        self,
+        h: sys_host.LinuxHost,
+        size: int = 32,
+        timeout_s: int = 7200,
+        log_level: str = "Info",
+    ) -> None:
+        super().__init__(h)
+        self.size: int = size
+        self.timeout_s: int = timeout_s
+        self.log_level: str = log_level
+
+    def toJSON(self) -> dict:
+        json_obj = super().toJSON()
+        json_obj["size"] = self.size
+        json_obj["timeout_s"] = self.timeout_s
+        json_obj["log_level"] = self.log_level
+        return json_obj
+
+    @classmethod
+    def fromJSON(cls, system: sys_base.System, json_obj: dict) -> tpe.Self:
+        instance = super().fromJSON(system, json_obj)
+        instance.size = utils_base.get_json_attr_top(json_obj, "size")
+        instance.timeout_s = utils_base.get_json_attr_top(json_obj, "timeout_s")
+        instance.log_level = utils_base.get_json_attr_top(json_obj, "log_level")
+        return instance
+
+    def run_cmds(self, inst) -> list[str]:
+        ids = f"{TT_PCI_VENDOR_ID:04x}:{TT_DEVICE_IDS['wh']:04x}"
+        return [
+            "echo '=== load tt-kmd ==='",
+            "modprobe tenstorrent || insmod"
+            " /lib/modules/$(uname -r)/kernel/drivers/misc/tenstorrent.ko || true",
+            f"lspci -k -d {ids}",
+            "ls -l /dev/tenstorrent/ 2>&1 || echo 'no /dev/tenstorrent'",
+            "echo '=== tt-metal environment ==='",
+            ". /etc/profile.d/tt-metal.sh; env | grep -E '^(TT_|ARCH_NAME)' | sort",
+            "echo '=== matmul ==='",
+            # `timeout` so a hang ends the run with a diagnosable message rather
+            # than sitting until the orchestration's own timeout fires.
+            ". /etc/profile.d/tt-metal.sh;"
+            f" export TT_METAL_LOGGER_LEVEL={self.log_level};"
+            f" export TT_DEMO_M={self.size} TT_DEMO_K={self.size} TT_DEMO_N={self.size};"
+            # `|| rc=$?` rather than `; rc=$?` so a non-zero exit cannot abort
+            # the script if the guest runner ever adds `set -e`.
+            " rc=0;"
+            f" timeout {self.timeout_s} python3 /usr/local/bin/tt_matmul_demo.py || rc=$?;"
+            ' if [ $rc -eq 124 ]; then echo "TTSIM MATMUL: FAIL timed out after'
+            f' {self.timeout_s}s";'
+            ' elif [ $rc -ne 0 ]; then echo "TTSIM MATMUL: FAIL exit $rc"; fi',
+        ]
+
+
 class TenstorrentKmdApp(sys_app.BaseLinuxApplication):
     """Check that tt-kmd binds the simulated device and exposes a chardev.
 

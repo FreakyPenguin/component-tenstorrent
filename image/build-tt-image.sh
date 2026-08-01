@@ -20,6 +20,15 @@
 #
 # Usage:
 #   image/build-tt-image.sh [-b BASE_IMAGE] [-o OUT_DIR] [-n NAME]
+#                           [-s PROVISION_SCRIPT] [-B]
+#
+# -s names the guest-side script to run (default provision-tt-guest.sh). The
+#    whole image/ directory is copied into the guest, so a script may use files
+#    next to it.
+# -B layers on the base image with a qcow2 backing file instead of copying it.
+#    Only the delta is stored, which matters when stacking a multi-GiB stage
+#    such as tt-metal on top of an existing image. The result then depends on
+#    the base image staying put; drop -B for a standalone image.
 
 set -euo pipefail
 
@@ -28,21 +37,32 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_IMAGE="${BASE_IMAGE:-/global_input/images/base/base}"
 OUT_DIR="${OUT_DIR:-/global_input}"
 NAME="${NAME:-tenstorrent}"
+PROVISION_SCRIPT="${PROVISION_SCRIPT:-provision-tt-guest.sh}"
+USE_BACKING="${USE_BACKING:-0}"
 SSH_USER="${SSH_USER:-ubuntu}"
 SSH_PASS="${SSH_PASS:-ubuntu}"
 MEM="${MEM:-4096}"
 CPUS="${CPUS:-$(nproc)}"
+# Match the CPU the experiments run on (QemuSim uses -cpu Skylake-Server). The
+# default qemu64 model has no AVX at all, and importing ttnn on it dies with
+# SIGILL -- so provisioning would happily build an image that cannot run.
+# QEMU masks any feature TCG cannot emulate, so this stays correct without KVM.
+CPU_MODEL="${CPU_MODEL:-Skylake-Server}"
+ACCEL="${ACCEL:-kvm:tcg}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
 PROVISION_TIMEOUT="${PROVISION_TIMEOUT:-3600}"
 
-while getopts "b:o:n:" opt; do
+while getopts "b:o:n:s:B" opt; do
   case "$opt" in
     b) BASE_IMAGE="$OPTARG" ;;
     o) OUT_DIR="$OPTARG" ;;
     n) NAME="$OPTARG" ;;
-    *) echo "usage: $0 [-b BASE_IMAGE] [-o OUT_DIR] [-n NAME]" >&2; exit 1 ;;
+    s) PROVISION_SCRIPT="$OPTARG" ;;
+    B) USE_BACKING=1 ;;
+    *) echo "usage: $0 [-b BASE_IMAGE] [-o OUT_DIR] [-n NAME] [-s SCRIPT] [-B]" >&2; exit 1 ;;
   esac
 done
+[ -f "$HERE/$PROVISION_SCRIPT" ] || { echo "no provision script $HERE/$PROVISION_SCRIPT" >&2; exit 1; }
 
 for tool in qemu-system-x86_64 qemu-img sshpass virt-copy-out virt-cat; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
@@ -72,15 +92,25 @@ ssh_g()  { sshpass -p "$SSH_PASS" ssh  $SSH_OPTS -p "$PORT" "$SSH_USER@127.0.0.1
 scp_g()  { sshpass -p "$SSH_PASS" scp  $SSH_OPTS -P "$PORT" "$@"; }
 
 echo "==> building '$NAME' from $BASE_IMAGE"
-echo "    work=$WORK port=$PORT"
+echo "    work=$WORK port=$PORT script=$PROVISION_SCRIPT backing=$USE_BACKING"
 
-# Work on a full copy: the result must stand alone, not depend on a backing file.
-echo "==> copying base image"
-qemu-img convert -O qcow2 "$BASE_IMAGE" "$WORK/$NAME.qcow2"
+if [ "$USE_BACKING" = 1 ]; then
+  # Store only the delta. The backing path must be absolute: the image is used
+  # from a different working directory than it is built in.
+  echo "==> creating overlay on $BASE_IMAGE"
+  qemu-img create -f qcow2 -F "$(qemu-img info --output=json "$BASE_IMAGE" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["format"])')" \
+      -b "$(readlink -f "$BASE_IMAGE")" "$WORK/$NAME.qcow2" >/dev/null
+else
+  # Full copy: the result stands alone, not depending on a backing file.
+  echo "==> copying base image"
+  qemu-img convert -O qcow2 "$BASE_IMAGE" "$WORK/$NAME.qcow2"
+fi
 
 echo "==> booting guest"
 qemu-system-x86_64 \
-    -machine q35 -m "$MEM" -smp "$CPUS" -display none \
+    -machine "q35,accel=$ACCEL" -cpu "$CPU_MODEL" \
+    -m "$MEM" -smp "$CPUS" -display none \
     -drive "file=$WORK/$NAME.qcow2,if=virtio,format=qcow2" \
     -netdev "user,id=n0,hostfwd=tcp::$PORT-:22" -device virtio-net,netdev=n0 \
     -serial "file:$WORK/serial.log" </dev/null >/dev/null 2>&1 &
@@ -99,11 +129,16 @@ until ssh_g true 2>/dev/null; do
 done
 echo "==> ssh up"
 
-echo "==> provisioning"
-scp_g "$HERE/provision-tt-guest.sh" "$SSH_USER@127.0.0.1:/tmp/provision.sh"
+echo "==> provisioning with $PROVISION_SCRIPT"
+# tar over ssh rather than `scp -r`: recent OpenSSH uses the SFTP protocol for
+# scp and rejects a "." source path, and this copies the directory contents
+# without depending on scp's varying directory-target semantics.
+tar -C "$HERE" -cf - . | ssh_g "rm -rf /tmp/ttimg && mkdir -p /tmp/ttimg && tar -C /tmp/ttimg -xf -"
 timeout "$PROVISION_TIMEOUT" \
   sshpass -p "$SSH_PASS" ssh $SSH_OPTS -p "$PORT" "$SSH_USER@127.0.0.1" \
-  "chmod +x /tmp/provision.sh && sudo -E TT_KMD_REPO='${TT_KMD_REPO:-}' TT_KMD_REF='${TT_KMD_REF:-}' /tmp/provision.sh"
+  "chmod +x /tmp/ttimg/*.sh && sudo -E TT_KMD_REPO='${TT_KMD_REPO:-}' TT_KMD_REF='${TT_KMD_REF:-}' \
+   TTNN_VERSION='${TTNN_VERSION:-}' TORCH_VERSION='${TORCH_VERSION:-}' \
+   /tmp/ttimg/$PROVISION_SCRIPT"
 
 echo "==> shutting down"
 ssh_g "sudo shutdown -P now" >/dev/null 2>&1 || true

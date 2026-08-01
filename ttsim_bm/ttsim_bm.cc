@@ -68,6 +68,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 
 /* Must precede the extern "C" block: the SimBricks headers reach <atomic>
@@ -119,7 +120,17 @@ uint64_t devctrl_flags = 0;
 
 /* Statistics, printed at exit; mirrors the accel-sim example's counters. */
 uint64_t stat_mmio_reads = 0, stat_mmio_writes = 0;
+/* Of the writes, how many the host posted. Posted writes cost the guest nothing
+ * beyond the trap, while every read and every non-posted write stalls it for a
+ * round trip -- which is what makes the batch size below matter. */
+uint64_t stat_mmio_writes_posted = 0;
 uint64_t stat_dma_reads = 0, stat_dma_writes = 0;
+uint64_t stat_clocks = 0;
+
+/** Seconds between progress lines on stderr; 0 disables them. Runs of the full
+ * Tenstorrent stack take long enough that "is it stuck or just slow?" is not
+ * otherwise answerable. */
+double progress_interval = 10.0;
 
 /** An MMIO request copied out of its shared-memory slot, awaiting a libttsim
  * call. See invariant 1 at the top of this file. */
@@ -466,6 +477,9 @@ void DrainDeferredMmio() {
       SendPcieOut(msg, SIMBRICKS_PROTO_PCIE_D2H_MSG_READCOMP);
     } else {
       stat_mmio_writes++;
+      if (r.posted) {
+        stat_mmio_writes_posted++;
+      }
 
       if (ok) {
         lib.pci_mem_wr_bytes(paddr, r.data, r.len);
@@ -518,6 +532,7 @@ void RunClocks() {
   }
 
   lib.clock(n);
+  stat_clocks += n;
 
   uint64_t target = start + static_cast<uint64_t>(n) * ps_per_clock;
   if (main_time < target) {
@@ -525,10 +540,49 @@ void RunClocks() {
   }
 }
 
+double MonotonicSeconds() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+}
+
+/** Rates since the previous call, so a stall is visible as zeros rather than as
+ * a flat total. */
+void ReportProgress() {
+  static double last_t = 0.0;
+  static uint64_t last_clocks = 0, last_mmio = 0, last_dma = 0;
+
+  double now = MonotonicSeconds();
+  if (last_t == 0.0) {
+    last_t = now;
+    return;
+  }
+  double dt = now - last_t;
+  if (dt < progress_interval) {
+    return;
+  }
+
+  uint64_t mmio = stat_mmio_reads + stat_mmio_writes;
+  uint64_t dma = stat_dma_reads + stat_dma_writes;
+  fprintf(stderr,
+          "ttsim_bm: %6.2f MHz  %8.0f mmio/s  %7.0f dma/s   "
+          "[dev %.3f ms, mmio %" PRIu64 ", dma %" PRIu64 "]\n",
+          static_cast<double>(stat_clocks - last_clocks) / dt / 1e6,
+          static_cast<double>(mmio - last_mmio) / dt,
+          static_cast<double>(dma - last_dma) / dt,
+          static_cast<double>(main_time) / 1e9, mmio, dma);
+
+  last_t = now;
+  last_clocks = stat_clocks;
+  last_mmio = mmio;
+  last_dma = dma;
+}
+
 /******************************************************************************/
 /* Main loop */
 
 void RunLoop() {
+  uint32_t tick = 0;
   while (!exiting) {
     while (SimbricksPcieIfD2HOutSync(&pcie_if, main_time)) {
     }
@@ -536,6 +590,12 @@ void RunLoop() {
     PollPcieAll();
     DrainDeferredMmio();
     RunClocks();
+
+    /* Amortized: an iteration is only a few microseconds, and clock_gettime
+     * every one of them would be a measurable fraction of it. */
+    if (progress_interval > 0.0 && (++tick & 0xFFF) == 0) {
+      ReportProgress();
+    }
 
     if (SimbricksBaseIfInTerminated(&pcie_if.base)) {
       exiting = true;
@@ -699,6 +759,8 @@ void PrintUsage(const char *argv0) {
           "  --clock-freq-mhz N     device clock frequency (default 1000)\n"
           "  --max-batch-clocks N   clock steps per batch (default 500)\n"
           "  --bar4-size N          override BAR4 size in bytes\n"
+          "  --progress-secs N      progress line interval, 0 to disable"
+          " (default 10)\n"
           "  --selftest             drive libttsim directly, no SimBricks\n",
           argv0);
 }
@@ -748,6 +810,8 @@ bool ParseOptions(int argc, char *argv[], struct Options *o) {
       max_batch_clocks = static_cast<uint32_t>(strtoul(v, nullptr, 0));
     } else if (strcmp(a, "--bar4-size") == 0) {
       bar4_size_override = strtoull(v, nullptr, 0);
+    } else if (strcmp(a, "--progress-secs") == 0) {
+      progress_interval = strtod(v, nullptr);
     } else {
       fprintf(stderr, "ttsim_bm: unknown option '%s'\n", a);
       return false;
@@ -834,12 +898,13 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr,
             "ttsim_bm: MMIO READS = %" PRIu64 "\n"
-            "ttsim_bm: MMIO WRITES = %" PRIu64 "\n"
+            "ttsim_bm: MMIO WRITES = %" PRIu64 " (%" PRIu64 " posted)\n"
             "ttsim_bm: DMA READS = %" PRIu64 "\n"
             "ttsim_bm: DMA WRITES = %" PRIu64 "\n"
+            "ttsim_bm: CLOCK STEPS = %" PRIu64 "\n"
             "ttsim_bm: final time = %" PRIu64 " ps\n",
-            stat_mmio_reads, stat_mmio_writes, stat_dma_reads, stat_dma_writes,
-            main_time);
+            stat_mmio_reads, stat_mmio_writes, stat_mmio_writes_posted,
+            stat_dma_reads, stat_dma_writes, stat_clocks, main_time);
     ret = 0;
   }
 
