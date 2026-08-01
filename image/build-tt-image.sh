@@ -74,6 +74,17 @@ WORK="$(mktemp -d)"
 QEMU_PID=""
 
 cleanup() {
+  rc=$?
+  # On failure the guest's console is the only record of why -- an ssh session
+  # that dies mid-provision says nothing about the panic that killed it. Keep it
+  # before the work directory goes away.
+  if [ "$rc" -ne 0 ] && [ -f "$WORK/serial.log" ]; then
+    keep="${SERIAL_LOG_DIR:-/tmp}/build-$NAME-serial.log"
+    cp "$WORK/serial.log" "$keep" 2>/dev/null && {
+      echo "--- last 25 lines of guest console (full log: $keep) ---" >&2
+      tail -25 "$keep" >&2
+    }
+  fi
   if [ -n "$QEMU_PID" ] && kill -0 "$QEMU_PID" 2>/dev/null; then
     kill "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
@@ -159,16 +170,33 @@ KVER="$(virt-cat -a "$WORK/$NAME.qcow2" /etc/simbricks-kernel-version | tr -d '\
 echo "    kernel $KVER"
 
 mkdir -p "$DEST/boot"
-virt-copy-out -a "$WORK/$NAME.qcow2" \
-    "/boot/vmlinuz-$KVER" "/boot/initrd.img-$KVER" "$DEST/boot/"
+virt-copy-out -a "$WORK/$NAME.qcow2" "/boot/vmlinuz-$KVER" "$DEST/boot/"
 mv -f "$DEST/boot/vmlinuz-$KVER" "$DEST/boot/vmlinuz"
-mv -f "$DEST/boot/initrd.img-$KVER" "$DEST/boot/initrd"
+
+# The SimBricks custom kernel builds in everything needed to mount root and
+# wants no initrd -- which is a large part of why it boots so much faster than
+# the distro kernel, and boot length is what a synchronized run pays for. The
+# provisioner says which case this is.
+rm -f "$DEST/boot/initrd"
+needs_initrd="$(virt-cat -a "$WORK/$NAME.qcow2" /etc/simbricks-needs-initrd 2>/dev/null \
+               | tr -d '\r\n' || echo yes)"
+if [ "$needs_initrd" != "no" ]; then
+    virt-copy-out -a "$WORK/$NAME.qcow2" "/boot/initrd.img-$KVER" "$DEST/boot/"
+    mv -f "$DEST/boot/initrd.img-$KVER" "$DEST/boot/initrd"
+    echo "    initrd extracted (modular kernel)"
+else
+    echo "    no initrd needed"
+fi
 
 echo "==> installing image"
 mv -f "$WORK/$NAME.qcow2" "$DEST/$NAME"
 
 echo
 echo "built $DEST/$NAME"
-echo "  kernel:  $DEST/boot/vmlinuz"
-echo "  initrd:  $DEST/boot/initrd"
+echo "  kernel:  $DEST/boot/vmlinuz  ($KVER)"
+if [ -f "$DEST/boot/initrd" ]; then
+    echo "  initrd:  $DEST/boot/initrd"
+else
+    echo "  initrd:  none (kernel needs no initrd)"
+fi
 echo "  tt-kmd:  $(virt-cat -a "$DEST/$NAME" /etc/tt-kmd.gitrev 2>/dev/null | tr -d '\r\n')"

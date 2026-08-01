@@ -106,8 +106,14 @@ def make_instantiation():
     # wait on -- it then falls straight through to cleanup and SIGINTs QEMU
     # mid-boot, reporting success.
     host_sim.wait_terminate = True
-    # The distro kernel is modular and cannot mount root without this.
-    host_sim.initrd = INITRD
+    # Only the distro kernel needs one -- it is modular and cannot mount root
+    # without it. The SimBricks custom kernel (image/build-tt-kernel.sh) builds
+    # everything in, and build-tt-image.sh then extracts no initrd at all. That
+    # is not just tidiness: it is a large part of why it reaches the payload in
+    # ~1 s of guest time instead of ~12, which is what a synchronized run pays
+    # for.
+    if os.path.exists(INITRD):
+        host_sim.initrd = INITRD
 
     dev_sim = tt_bm.TTSimDevSim(simulation, lib_path=TTSIM_LIB)
     dev_sim.name = "ttsim"

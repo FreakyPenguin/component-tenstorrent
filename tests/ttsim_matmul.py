@@ -120,8 +120,10 @@ def make_instantiation():
     # wait on -- it then falls straight through to cleanup and SIGINTs QEMU
     # mid-boot, reporting success.
     host_sim.wait_terminate = True
-    # The distro kernel is modular and cannot mount root without this.
-    host_sim.initrd = INITRD
+    # Only needed for a modular kernel; the SimBricks custom kernel builds
+    # everything in. See the note in ttsim_kmd.py.
+    if os.path.exists(INITRD):
+        host_sim.initrd = INITRD
 
     dev_sim = tt_bm.TTSimDevSim(simulation, lib_path=TTSIM_LIB)
     dev_sim.name = "ttsim"
