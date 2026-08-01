@@ -117,6 +117,10 @@ def make_instantiation():
 
     dev_sim = tt_bm.TTSimDevSim(simulation, lib_path=TTSIM_LIB)
     dev_sim.name = "ttsim"
+    if "TTSIM_MAX_BATCH_CLOCKS" in os.environ:
+        dev_sim.max_batch_clocks = int(os.environ["TTSIM_MAX_BATCH_CLOCKS"])
+    if "TTSIM_EXTRA_ARGS" in os.environ:
+        dev_sim.extra_args = os.environ["TTSIM_EXTRA_ARGS"]
     dev_sim.add(accel)
 
     if os.environ.get("TTSIM_SYNC", "0") == "1":

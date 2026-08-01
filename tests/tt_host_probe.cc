@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 #include <simbricks/base/cxxatomicfix.h>
 
@@ -485,18 +486,79 @@ void TestDma() {
 
 }  // namespace
 
+/** Hold the link open and otherwise idle for `secs` of wall time.
+ *
+ * Gives the adapter a live peer with nothing to do, so its reported clock rate
+ * is its real loop throughput at whatever --max-batch-clocks it was given. That
+ * is the half tests/tt_clock_bench cannot see: the bench measures libttsim's own
+ * per-call cost with no SimBricks plumbing, this measures the cost of the
+ * plumbing wrapped around it. */
+void IdleHold(double secs) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  double end = ts.tv_sec + ts.tv_nsec * 1e-9 + secs;
+
+  fprintf(stderr, "probe: holding the link idle for %.1f s\n", secs);
+  for (;;) {
+    while (SimbricksPcieIfH2DOutSync(&pcie_if, cur_ts)) {
+    }
+    while (Poll()) {
+    }
+    if (peer_gone || SimbricksBaseIfInTerminated(&pcie_if.base)) {
+      fprintf(stderr, "probe: peer terminated during idle hold\n");
+      return;
+    }
+
+    if (is_sync) {
+      uint64_t next_in = SimbricksPcieIfD2HInTimestamp(&pcie_if);
+      uint64_t next_sync = SimbricksPcieIfH2DOutNextSync(&pcie_if);
+      uint64_t next_ts = next_in <= next_sync ? next_in : next_sync;
+      if (next_ts > cur_ts) {
+        cur_ts = next_ts;
+      }
+    } else {
+      cur_ts += step_ps;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (ts.tv_sec + ts.tv_nsec * 1e-9 >= end) {
+      return;
+    }
+  }
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     fprintf(stderr,
-            "Usage: %s CONNECT-URL\n"
+            "Usage: %s CONNECT-URL [--idle-secs N]\n"
             "  e.g. connect:/tmp/tt.sock:sync=true:latency=500:"
-            "sync_interval=500\n",
+            "sync_interval=500\n"
+            "  --idle-secs N  skip the tests; hold the link idle for N seconds\n"
+            "                 so the device's own progress lines report its\n"
+            "                 loop throughput\n",
             argv[0]);
     return 1;
   }
 
+  double idle_secs = 0.0;
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--idle-secs") == 0 && i + 1 < argc) {
+      idle_secs = strtod(argv[++i], nullptr);
+    } else {
+      fprintf(stderr, "probe: unknown argument '%s'\n", argv[i]);
+      return 1;
+    }
+  }
+
   if (Connect(argv[1]) != 0) {
     return 1;
+  }
+
+  if (idle_secs > 0.0) {
+    IdleHold(idle_secs);
+    volatile union SimbricksProtoPcieH2D *m = AllocOut();
+    SimbricksPcieIfH2DOutSend(&pcie_if, m, SIMBRICKS_PROTO_MSG_TYPE_TERMINATE);
+    return 0;
   }
 
   SetupTlb0();

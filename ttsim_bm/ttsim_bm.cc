@@ -67,6 +67,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -95,6 +96,13 @@ constexpr uint16_t kMaxMmioLen = 64;
 /* Fallback cap on a single DMA sub-operation. The real limit is derived from
  * the negotiated message size at startup; libttsim chunks at 4 KiB anyway. */
 constexpr uint32_t kMaxDmaChunkCap = 4096;
+
+/* Ceiling on one libttsim_clock() call. Keeps the count inside the uint32_t the
+ * ABI takes, and bounds how long a synchronized batch can go without emitting a
+ * progress line or noticing a terminated peer. At 1 clock per ns this is ~1 ms
+ * of simulated time, far above the window a 500 ns sync interval produces, so
+ * it does not bind in practice. */
+constexpr uint64_t kMaxClocksPerCall = 1u << 20;
 
 struct LibTtsim lib;
 const struct TtsimChipInfo *chip;
@@ -126,6 +134,22 @@ uint64_t stat_mmio_reads = 0, stat_mmio_writes = 0;
 uint64_t stat_mmio_writes_posted = 0;
 uint64_t stat_dma_reads = 0, stat_dma_writes = 0;
 uint64_t stat_clocks = 0;
+
+/* Synchronized runs go exactly as fast as their slowest component at each
+ * instant, so the only thing that makes the device model worth optimizing is
+ * time the *peer* spends blocked on it. From this side that shows up as its
+ * complement: stretches where we have run to the deadline and have nothing left
+ * to do until the peer advances. A run that is mostly `stat_wait_peer_s` is
+ * QEMU-bound, and making libttsim faster buys nothing.
+ *
+ * Timed per blocked->running transition rather than per loop iteration: a
+ * clock_gettime on every iteration would be a measurable share of one. */
+double stat_wait_peer_s = 0.0;
+bool waiting_for_peer = false;
+double wait_began = 0.0;
+double link_up_at = 0.0;
+
+double MonotonicSeconds();
 
 /** Seconds between progress lines on stderr; 0 disables them. Runs of the full
  * Tenstorrent stack take long enough that "is it stuck or just slow?" is not
@@ -499,26 +523,48 @@ void DrainDeferredMmio() {
 
 /** Run a batch of libttsim clock steps and advance main_time accordingly.
  *
- * When synchronized we must not run past the point where SimBricks next needs
- * us, so the batch is clipped to that deadline. If the deadline has already
- * passed we run nothing and let the caller poll again -- that spin is the
- * correct synchronized behavior while waiting for the peer to advance.
+ * The two modes bound the batch for entirely different reasons, so they do not
+ * share a knob:
+ *
+ * - Synchronized: SimBricks computes exactly how far ahead it is safe to run --
+ *   the earlier of the next incoming message becoming due and the next sync we
+ *   owe the peer. Run that whole window. Stopping short of it would only add
+ *   loop iterations, because by construction nothing can need our attention
+ *   before the deadline. `max_batch_clocks` deliberately does not apply here.
+ *
+ * - Unsynchronized: there is no horizon to respect, so the only thing bounding
+ *   the batch is how long we are prepared to leave an incoming MMIO request
+ *   unanswered. That is what `max_batch_clocks` is for.
+ *
+ * Batch size turns out to matter far less than it looks: tests/tt_clock_bench
+ * measures 10.96 MHz at a batch of 1 against 11.84 MHz at a batch of a million,
+ * so libttsim_clock's per-call cost is a couple of nanoseconds against ~87 ns
+ * per clock step. The device model is simply slow; chopping it up is not what
+ * makes it slow.
+ *
+ * If the deadline has already passed we run nothing and let the caller poll
+ * again -- that spin is the correct synchronized behavior while waiting for the
+ * peer to advance.
  *
  * A DMA inside libttsim_clock advances main_time on its own via DmaPumpUntil,
  * so the final assignment takes the later of the two rather than adding to it. */
 void RunClocks() {
   uint64_t start = main_time;
-  uint32_t n = max_batch_clocks;
+  uint64_t n;
 
   if (is_sync) {
     uint64_t deadline = NextSimbricksDeadline();
     if (deadline <= main_time) {
       /* Already at the point where SimBricks needs us. Spin and let the caller
        * poll again; the peer has to advance before we may. */
+      if (!waiting_for_peer) {
+        waiting_for_peer = true;
+        wait_began = MonotonicSeconds();
+      }
       return;
     }
-    uint64_t budget = (deadline - main_time) / ps_per_clock;
-    if (budget == 0) {
+    n = (deadline - main_time) / ps_per_clock;
+    if (n == 0) {
       /* The deadline is less than one clock step away, so there is no device
        * work that can happen before it. Jump straight to it: returning without
        * advancing would livelock, because nothing else moves main_time and the
@@ -526,12 +572,24 @@ void RunClocks() {
       main_time = deadline;
       return;
     }
-    if (budget < n) {
-      n = static_cast<uint32_t>(budget);
-    }
+  } else {
+    n = max_batch_clocks;
   }
 
-  lib.clock(n);
+  /* About to do real work, so any stretch of waiting on the peer ends here. */
+  if (waiting_for_peer) {
+    stat_wait_peer_s += MonotonicSeconds() - wait_began;
+    waiting_for_peer = false;
+  }
+
+  /* libttsim_clock takes a uint32_t, and an unbounded batch would also stall
+   * progress reporting and delay noticing a peer that has terminated. Far above
+   * any window a 500 ns sync interval produces, so it never binds in practice. */
+  if (n > kMaxClocksPerCall) {
+    n = kMaxClocksPerCall;
+  }
+
+  lib.clock(static_cast<uint32_t>(n));
   stat_clocks += n;
 
   uint64_t target = start + static_cast<uint64_t>(n) * ps_per_clock;
@@ -546,11 +604,38 @@ double MonotonicSeconds() {
   return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
+/** Dump a counter snapshot. Driven by SIGUSR1, which SimBricks sends to every
+ * simulator every `--profile-int` seconds.
+ *
+ * A single total at exit is close to useless for deciding whether the device is
+ * holding the simulation back: it averages in the startup window, where the peer
+ * has not been launched yet and this side necessarily waits, and the shutdown
+ * window, where the peer is already gone. A time series lets both ends be
+ * trimmed and the steady state read off directly. */
+void DumpProfile(int /*sig*/) {
+  double now = MonotonicSeconds();
+  double waited = stat_wait_peer_s;
+  if (waiting_for_peer) {
+    waited += now - wait_began;
+  }
+  /* async-signal-safety: this is a diagnostic path in a single-threaded program
+   * whose only other work is a compute loop, so a stdio call here cannot
+   * interleave with one in progress except through the progress printer, which
+   * is rare enough to accept for a debugging aid. */
+  fprintf(stderr,
+          "ttsim_bm: PROFILE t=%.3f dev_ns=%" PRIu64 " clocks=%" PRIu64
+          " wait_peer_s=%.3f mmio=%" PRIu64 " dma=%" PRIu64 "\n",
+          link_up_at > 0.0 ? now - link_up_at : 0.0, main_time / 1000,
+          stat_clocks, waited, stat_mmio_reads + stat_mmio_writes,
+          stat_dma_reads + stat_dma_writes);
+}
+
 /** Rates since the previous call, so a stall is visible as zeros rather than as
  * a flat total. */
 void ReportProgress() {
   static double last_t = 0.0;
   static uint64_t last_clocks = 0, last_mmio = 0, last_dma = 0;
+  static double last_wait = 0.0;
 
   double now = MonotonicSeconds();
   if (last_t == 0.0) {
@@ -564,13 +649,28 @@ void ReportProgress() {
 
   uint64_t mmio = stat_mmio_reads + stat_mmio_writes;
   uint64_t dma = stat_dma_reads + stat_dma_writes;
+
+  /* Include the stretch currently in progress, so a device that is blocked for
+   * the whole interval reports ~100% rather than 0% until it happens to
+   * unblock. */
+  double waited = stat_wait_peer_s;
+  if (waiting_for_peer) {
+    waited += now - wait_began;
+  }
+  char wait_note[48] = "";
+  if (is_sync) {
+    snprintf(wait_note, sizeof(wait_note), ", idle waiting on peer %.0f%%",
+             100.0 * (waited - last_wait) / dt);
+  }
+
   fprintf(stderr,
           "ttsim_bm: %6.2f MHz  %8.0f mmio/s  %7.0f dma/s   "
-          "[dev %.3f ms, mmio %" PRIu64 ", dma %" PRIu64 "]\n",
+          "[dev %.3f ms, mmio %" PRIu64 ", dma %" PRIu64 "%s]\n",
           static_cast<double>(stat_clocks - last_clocks) / dt / 1e6,
           static_cast<double>(mmio - last_mmio) / dt,
           static_cast<double>(dma - last_dma) / dt,
-          static_cast<double>(main_time) / 1e9, mmio, dma);
+          static_cast<double>(main_time) / 1e9, mmio, dma, wait_note);
+  last_wait = waited;
 
   last_t = now;
   last_clocks = stat_clocks;
@@ -893,8 +993,16 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     link_up = true;
+    link_up_at = MonotonicSeconds();
+    /* SimBricks sends SIGUSR1 to every simulator every --profile-int seconds. */
+    signal(SIGUSR1, DumpProfile);
 
     RunLoop();
+
+    if (waiting_for_peer) {
+      stat_wait_peer_s += MonotonicSeconds() - wait_began;
+      waiting_for_peer = false;
+    }
 
     fprintf(stderr,
             "ttsim_bm: MMIO READS = %" PRIu64 "\n"
@@ -905,6 +1013,20 @@ int main(int argc, char *argv[]) {
             "ttsim_bm: final time = %" PRIu64 " ps\n",
             stat_mmio_reads, stat_mmio_writes, stat_mmio_writes_posted,
             stat_dma_reads, stat_dma_writes, stat_clocks, main_time);
+
+    /* The number that decides whether optimizing libttsim is worth anything.
+     * A synchronized run is only as fast as whichever side is behind, so time
+     * we spend idle at the deadline is time the device was NOT holding the
+     * simulation back. Near 100% means the run is peer-bound and a faster chip
+     * model buys nothing. */
+    if (is_sync) {
+      double elapsed = MonotonicSeconds() - link_up_at;
+      fprintf(stderr,
+              "ttsim_bm: LINK TIME = %.1f s, of which idle waiting on peer"
+              " %.1f s (%.0f%%)\n",
+              elapsed, stat_wait_peer_s,
+              elapsed > 0.0 ? 100.0 * stat_wait_peer_s / elapsed : 0.0);
+    }
     ret = 0;
   }
 

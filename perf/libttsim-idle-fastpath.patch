@@ -1,0 +1,94 @@
+--- a/src/sim.h	2026-07-31 21:14:28.672447486 +0000
++++ b/src/sim.h	2026-08-01 19:54:37.475803083 +0000
+@@ -592,6 +592,12 @@
+     PcieTile p_tile;
+     DramChannel dram[NUM_DRAM_CHANNELS];
+     uint64_t rv32_cores_active;
++    // PROTOTYPE: how many Tensix-tile rv32 cores / tensix inst pipes are active
++    // anywhere on this chip. Lets clock_current_chip skip its whole per-tile
++    // sweep when the answer is "none", which is the entire boot and driver-probe
++    // phase. Maintained at the four sites that change the per-tile masks.
++    uint32_t t_active_rv32;
++    uint32_t t_active_pipes;
+ };
+ 
+ extern uint32_t g_current_chip_id;
+@@ -609,6 +615,8 @@
+ #define g_p_tile g_chips[g_current_chip_id].p_tile
+ #define g_dram g_chips[g_current_chip_id].dram
+ #define g_rv32_cores_active g_chips[g_current_chip_id].rv32_cores_active
++#define g_t_active_rv32 g_chips[g_current_chip_id].t_active_rv32
++#define g_t_active_pipes g_chips[g_current_chip_id].t_active_pipes
+ #else
+ #define g_t_tiles g_chips[0].t_tiles
+ #define g_e_tiles g_chips[0].e_tiles
+@@ -616,6 +624,8 @@
+ #define g_p_tile g_chips[0].p_tile
+ #define g_dram g_chips[0].dram
+ #define g_rv32_cores_active g_chips[0].rv32_cores_active
++#define g_t_active_rv32 g_chips[0].t_active_rv32
++#define g_t_active_pipes g_chips[0].t_active_pipes
+ #endif
+ 
+ void libttsim_pci_dma_mem_rd_bytes(uint64_t paddr, void *p, uint32_t size);
+--- a/src/sim.cpp	2026-07-31 21:14:28.672369147 +0000
++++ b/src/sim.cpp	2026-08-01 19:54:37.482819971 +0000
+@@ -60,11 +60,14 @@
+ 
+ void ttsim_rv32_set_core_active(char tile_type, uint32_t tile_id, uint32_t rv32_id, bool active) {
+     if (tile_type == 'T') {
++        uint32_t before = g_t_tiles[tile_id].rv32_cores_active;
+         if (active) {
+             g_t_tiles[tile_id].rv32_cores_active |= 1 << rv32_id;
+         } else {
+             g_t_tiles[tile_id].rv32_cores_active &= ~(1 << rv32_id);
+         }
++        g_t_active_rv32 += __builtin_popcount(g_t_tiles[tile_id].rv32_cores_active)
++                         - __builtin_popcount(before);
+     } else {
+         TTSIM_VERIFY(tile_type == 'E', AssertionFailure, "tile_type=%c", tile_type);
+         uint32_t core_index = tile_id * RV32_CORES_PER_E_TILE + rv32_id;
+--- a/src/tensix.cpp	2026-07-31 21:14:28.673099750 +0000
++++ b/src/tensix.cpp	2026-08-01 19:54:37.483298990 +0000
+@@ -40,6 +40,9 @@
+     p_tensix->inst[pipe][inst_wr_ptr] = inst;
+     inst_wr_ptr = (inst_wr_ptr + 1) % TENSIX_INST_FIFO_SIZE;
+     p_tensix->inst_wr_ptr[pipe] = inst_wr_ptr;
++    if (!(p_tensix->inst_pipes_active & (1 << pipe))) {
++        g_t_active_pipes++;
++    }
+     p_tensix->inst_pipes_active |= 1 << pipe;
+ 
+     TTSIM_VERIFY(inst_wr_ptr != p_tensix->inst_rd_ptr[pipe], UnimplementedFunctionality, "pipe %d inst fifo full", pipe); // require 1 entry always empty
+--- a/src/libttsim.cpp	2026-07-31 21:14:28.671260243 +0000
++++ b/src/libttsim.cpp	2026-08-01 19:54:37.484880702 +0000
+@@ -772,6 +772,13 @@
+ }
+ 
+ static void clock_current_chip() {
++    // PROTOTYPE fast path. With no rv32 core and no tensix pipe active anywhere,
++    // every iteration of the sweep below provably does nothing: both inner masks
++    // are zero, so any_tensix stays false and the tile loop breaks immediately.
++    // Skipping it makes an idle clock O(1) instead of O(NUM_T_TILES).
++    if (g_t_active_rv32 == 0 && g_t_active_pipes == 0) {
++        goto eth_tiles;
++    }
+     for (uint32_t tile_id = 0; tile_id < std::size(g_t_tiles); tile_id++) {
+         TensixTile *p_tile = &g_t_tiles[tile_id];
+         // Hack: for simulator perf, we clock a tile repeatedly as long as it successfully executes at least one Tensix instruction
+@@ -794,6 +801,7 @@
+                             p_tensix->inst_rd_ptr[pipe] = inst_rd_ptr;
+                             if (inst_rd_ptr == p_tensix->inst_wr_ptr[pipe]) {
+                                 p_tensix->inst_pipes_active &= ~(1 << pipe);
++                                g_t_active_pipes--;
+                             }
+                         }
+                     }
+@@ -804,6 +812,7 @@
+             }
+         }
+     }
++eth_tiles:
+     for (uint64_t rv32_mask = g_rv32_cores_active; rv32_mask; rv32_mask &= rv32_mask-1) {
+         uint32_t core_index = __builtin_ctzll(rv32_mask);
+         uint32_t tile_id = core_index / RV32_CORES_PER_E_TILE;

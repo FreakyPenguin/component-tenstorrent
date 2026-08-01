@@ -8,3 +8,4 @@ tests/tt_host_probe
 tests/out/
 *.egg-info/
 image/kernel-out/
+tests/tt_clock_bench

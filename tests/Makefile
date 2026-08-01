@@ -30,13 +30,19 @@ DEPS      := $(SIMBRICKS_LIB_DIR)/libparser.a $(SIMBRICKS_LIB_DIR)/libpcie.a \
 LDLIBS    += -lpthread
 
 BIN := tt_host_probe
+BENCH := tt_clock_bench
 
 .PHONY: all
-all: $(BIN)
+all: $(BIN) $(BENCH)
 
 $(BIN): tt_host_probe.cc $(DEPS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $< $(DEPS) $(LDLIBS)
 
+# Needs no SimBricks libraries at all -- it drives libttsim directly, which is
+# the point: it measures the chip model in isolation from the adapter.
+$(BENCH): tt_clock_bench.cc ../ttsim_bm/libttsim_abi.cc
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ -ldl
+
 .PHONY: clean
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) $(BENCH)

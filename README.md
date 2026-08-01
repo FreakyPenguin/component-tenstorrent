@@ -21,6 +21,7 @@ own `ttsim-riscv64` (`--tt-device`) take.
 | `conda-recipes/` | Three packages: `…-sys-py`, `…-sim-bm-py`, `…-sim-bm-bin`. |
 | `image/` | Guest image provisioning: tt-kmd, then TT-Metalium / ttnn / PyTorch. |
 | `tests/` | Host-side probe (no guest needed) and the QEMU experiment scripts. |
+| `perf/` | Where `libttsim`'s time goes, and a prototype for the idle path. |
 
 ## Building
 
@@ -58,6 +59,18 @@ parameters are what shake out time-advance bugs.
 make -C tests SIMBRICKS_INC_DIR=$CONDA_PREFIX/include SIMBRICKS_LIB_DIR=$CONDA_PREFIX/lib
 ./tests/run_probe_test.sh
 ```
+
+`tests/tt_clock_bench` measures `libttsim`'s clock throughput against batch size,
+with no SimBricks plumbing, which is how to tell a slow chip model from an
+adapter that is interrupting it too often:
+
+```bash
+./tests/tt_clock_bench --lib ../ttsim/src/_out/release_wh/libttsim.so
+```
+
+For the other half — the adapter's own loop overhead — `tt_host_probe
+--idle-secs N` holds a real link open with nothing to do, so the device's
+progress lines report its loop throughput at a given `--max-batch-clocks`.
 
 `tests/ttsim_smoke.py` boots a Linux guest with the device attached and checks
 enumeration and vfio-pci binding. It needs a base disk image:
@@ -379,25 +392,58 @@ do not present results as cycle-accurate.
   straight through its wait loop, and SIGINTs every simulator — killing QEMU
   mid-boot while reporting the run as successful. It looks exactly like a hang
   partway through the kernel log. Both experiment scripts set `wait_terminate`.
-- **Performance.** Idle throughput is ~11.4 MHz of simulated device clock on one
-  core (50 M clock steps in 4.4 s under `--selftest`), i.e. roughly 88 s of host
-  time per simulated second. That is `libttsim`'s own ceiling, not adapter
-  overhead — the adapter measures the same rate end to end. Large DMAs are split
-  into 4 KiB blocking round-trips, each costing at least one link latency.
+- **Performance is `libttsim`'s, not the adapter's.** Idle throughput is
+  ~11.5 MHz of simulated device clock on one core, i.e. ~87 ns of host time per
+  clock step and ~88 s per simulated second. The obvious suspicion — that the
+  adapter throttles the model by chopping it into small batches so it can poll
+  SimBricks — does not hold up. `tests/tt_clock_bench` drives `libttsim` with no
+  SimBricks plumbing at all, and the whole range from a batch of 1 to a batch of
+  a million spans 8%:
+
+  | batch | `libttsim` alone | adapter, live idle peer |
+  |---|---|---|
+  | 1 | 10.96 MHz | 11.6 MHz |
+  | 64 | 11.39 MHz | 11.4 MHz |
+  | 500 | 11.56 MHz | 11.4 MHz |
+  | 4096 | 11.88 MHz | 11.8 MHz |
+  | 1000000 | 11.84 MHz | 13.0 MHz |
+
+  The right-hand column is the same sweep through the real adapter against a
+  live SimBricks peer (`tt_host_probe --idle-secs`), taken from `libttsim`'s own
+  end-of-run total rather than sampled intervals. Calling `libttsim_clock(1)`
+  with a full SimBricks poll between *every single clock step* costs about 12%
+  against effectively uninterrupted. `libttsim_clock(n)` is a bare `for` loop, so
+  there is no per-call setup to amortize; the model is simply slow. Large DMAs
+  are split into 4 KiB blocking round-trips, each costing at least one link
+  latency.
+
+  The cost is structural: `clock_current_chip()` sweeps every Tensix tile on
+  every clock, so idle throughput scales with tile count (Wormhole's 80 tiles
+  give 11.08 MHz, Blackhole's 140 give 6.41). That is worth fixing — in a
+  synchronized `ttsim_kmd.py` run QEMU is blocked on the device for **61%** of
+  the time. [`perf/`](perf/) has the measurement, a prototype that makes an idle
+  clock O(1) (bit-identical results; device-bound time drops to 1.7% and the run
+  is 31% shorter), and why parallelizing the model would not help here.
+- **`--profile-int S` makes the adapter dump a counter snapshot every S seconds**
+  via SIGUSR1, including how long it has sat idle waiting on the peer. That
+  ratio, not raw clock rate, is what decides whether the device model is worth
+  optimizing: a synchronized run is only as fast as whichever side is behind.
 - **Idle and busy device throughput differ by ~70x.** The adapter's progress
   lines show ~13 MHz while the Tensix cores are in reset and ~0.17 MHz once they
   are running code — a clock step that has to interpret RISC-V on 80 tiles costs
   far more than one that does not. Wall-clock time for the demo is dominated by
   this, not by the SimBricks link.
-- **`--max-batch-clocks` trades device throughput against MMIO latency.** A
-  request arriving mid-batch is not looked at until the batch ends, so the
-  default 500 steps means an MMIO round trip can take ~45 µs; batching smaller
-  costs little, since the per-iteration poll overhead is a few hundred ns against
-  64 steps ≈ 5.6 µs of clocking. `tests/ttsim_matmul.py` sets 64 for that reason,
-  but measurement says it is not what limits this workload: the whole 32×32 run
-  issues only ~27 k MMIO accesses and ~440 DMA transfers. tt-metal moves kernel
-  binaries and tensors through the host sysmem window and lets the *device* DMA
-  them, rather than pushing them through TLB windows with host stores.
+- **`--max-batch-clocks` only applies when unsynchronized, and is a minor knob.**
+  It bounds how long the device runs without looking for an incoming MMIO
+  request, so it trades a little throughput (see above — very little) for
+  response latency. When *synchronized* it does not apply at all: SimBricks
+  computes exactly how far ahead it is safe to run, and the adapter runs that
+  whole window, because nothing can need its attention before the deadline.
+  `tests/ttsim_matmul.py` sets 64, worth ~1 s of the 97 s run: the whole 32×32
+  run issues only ~27 k MMIO accesses and ~440 DMA transfers, because tt-metal
+  moves kernel binaries and tensors through the host sysmem window and lets the
+  *device* DMA them rather than pushing them through TLB windows with host
+  stores.
 - The adapter prints a progress line every `--progress-secs` seconds (10 by
   default) with the current clock rate and MMIO/DMA rates, and a summary at
   exit. On runs this long, "stuck or just slow?" is otherwise unanswerable.
